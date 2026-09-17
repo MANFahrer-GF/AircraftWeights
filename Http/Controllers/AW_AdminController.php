@@ -167,16 +167,31 @@ class AW_AdminController extends Controller
         return redirect()->route('aircraftweights.admin.index')->with('success', 'Gelöscht.');
     }
 
+    /**
+     * Bis zu wie vielen Pfund ein gespeicherter Wert als "gleich" gilt.
+     *
+     * Die Referenzen stehen in ganzen Kilogramm, phpVMS speichert Pfund. Ein
+     * Kilogramm sind 2,2 lb — viele reale Pfundwerte (174.198 lb, 147.300 lb)
+     * sind aus ganzen Kilogramm gar nicht erreichbar. Ohne Toleranz schrieb
+     * jeder Sync bei 62 Flugzeugen 1–3 lb um und kippte damit die exakten
+     * Gewichtssaetze, die die FleetDesk-Flottenpruefung als gewollt kennt.
+     * Gleicher Wert wie dort (`GEWICHT_TOLERANZ_LB`).
+     */
+    private const TOLERANZ_LB = 10.0;
+
     public function sync()
     {
         $colMap      = $this->weightColumns();
         $weightIndex = AW_IcaoWeight::all()->keyBy(fn($w) => strtoupper($w->icao));
         $overrides   = $this->subfleetOverrides();
         $aircraft    = DB::table('aircraft')->whereNotNull('icao')->where('icao', '!=', '')->get();
+        $gemischt    = $this->gemischteFlotten($aircraft, $colMap);
 
-        $synced      = 0;
+        $geschrieben = 0;
+        $unveraendert = 0;
         $missing     = 0;
         $ausFlotte   = 0;
+        $uebersprungen = [];
 
         foreach ($aircraft as $ac) {
             $icao = $weightIndex[strtoupper($ac->icao)] ?? null;
@@ -191,25 +206,96 @@ class AW_AdminController extends Controller
                 $ausFlotte++;
             }
 
-            $update = [];
-            if ($colMap['dow']  && $ref['dow']  !== null) $update[$colMap['dow']]  = $this->kgToLbs($ref['dow']);
-            if ($colMap['mzfw'] && $ref['mzfw'] !== null) $update[$colMap['mzfw']] = $this->kgToLbs($ref['mzfw']);
-            if ($colMap['mtow'] && $ref['mtow'] !== null) $update[$colMap['mtow']] = $this->kgToLbs($ref['mtow']);
-            if ($colMap['mlw']  && $ref['mlw']  !== null) $update[$colMap['mlw']]  = $this->kgToLbs($ref['mlw']);
+            // Nur Felder, die leer sind oder wirklich abweichen — Rundung ist keine Abweichung.
+            $update       = [];
+            $ueberschreibt = false;
+            foreach (['dow', 'mzfw', 'mtow', 'mlw'] as $feld) {
+                $spalte = $colMap[$feld];
+                if (!$spalte || $ref[$feld] === null) {
+                    continue;
+                }
 
-            if ($update) {
-                DB::table('aircraft')->where('id', $ac->id)->update($update);
+                $soll = $this->kgToLbs($ref[$feld]);
+                $ist  = (float) ($ac->$spalte ?? 0);
+
+                if ($ist <= 0) {
+                    $update[$spalte] = $soll;
+                } elseif (abs($soll - $ist) > self::TOLERANZ_LB) {
+                    $update[$spalte] = $soll;
+                    $ueberschreibt   = true;
+                }
             }
 
-            $synced++;
+            if (!$update) {
+                $unveraendert++;
+                continue;
+            }
+
+            // Eine Flotte, deren Flugzeuge selbst verschiedene Gewichte tragen, hat bewusst
+            // Varianten (DLH-A21N: D-AIEO gegen D-AIEA/D-AIEP). Ein Musterwert — und auch eine
+            // Flotten-Uebersteuerung, die ja nur EINEN Satz kennt — waere dort falsch. Leere
+            // Felder werden trotzdem gefuellt, vorhandene Werte nicht ueberschrieben.
+            if ($ueberschreibt && isset($gemischt[$ac->subfleet_id ?? 0]) && empty($ac->deleted_at)) {
+                $uebersprungen[] = $ac->registration;
+                continue;
+            }
+
+            DB::table('aircraft')->where('id', $ac->id)->update($update);
+            $geschrieben++;
         }
 
-        $msg = "Sync: {$synced} Flugzeuge aktualisiert, {$missing} ohne Referenz.";
+        $msg = "Sync: {$geschrieben} Flugzeuge geaendert, {$unveraendert} stimmten schon, {$missing} ohne Referenz.";
         if ($ausFlotte) {
-            $msg .= " Davon {$ausFlotte} aus einer Flotten-Uebersteuerung statt aus der Mustertabelle.";
+            $msg .= " {$ausFlotte} Flugzeuge beziehen ihre Werte aus einer Flotten-Uebersteuerung.";
+        }
+        if ($uebersprungen) {
+            sort($uebersprungen);
+            $msg .= ' Nicht ueberschrieben, weil ihre Flotte bewusst verschiedene Gewichte traegt: '
+                . implode(', ', array_slice($uebersprungen, 0, 20))
+                . (count($uebersprungen) > 20 ? ' …' : '')
+                . ' — bitte einzeln zuweisen oder die Flotte aufteilen.';
         }
 
         return redirect()->route('aircraftweights.admin.index')->with('success', $msg);
+    }
+
+    /**
+     * Flotten, deren lebende Flugzeuge untereinander verschiedene Gewichte tragen.
+     *
+     * Verglichen wird mit derselben Toleranz wie beim Schreiben: SP-LVA und SP-LVL
+     * unterscheiden sich im MTOW um 2 lb (Rundung), im DOW aber um 68 lb — Letzteres
+     * zaehlt.
+     *
+     * @return array<int,true>
+     */
+    private function gemischteFlotten($aircraft, array $colMap): array
+    {
+        $jeFlotte = [];
+        foreach ($aircraft as $ac) {
+            if (!empty($ac->deleted_at)) {
+                continue;
+            }
+            $werte = [];
+            foreach (['dow', 'mzfw', 'mtow', 'mlw'] as $feld) {
+                $werte[] = $colMap[$feld] ? (float) ($ac->{$colMap[$feld]} ?? 0) : 0.0;
+            }
+            $jeFlotte[$ac->subfleet_id ?? 0][] = $werte;
+        }
+
+        $gemischt = [];
+        foreach ($jeFlotte as $sf => $liste) {
+            $erste = $liste[0];
+            foreach ($liste as $werte) {
+                foreach ($werte as $i => $v) {
+                    if (abs($v - $erste[$i]) > self::TOLERANZ_LB) {
+                        $gemischt[$sf] = true;
+                        continue 3;
+                    }
+                }
+            }
+        }
+
+        return $gemischt;
     }
 
     /**
